@@ -1,0 +1,434 @@
+# import torch
+# import torch.nn as nn
+# from torch.utils.data import Dataset, DataLoader
+# import pandas as pd
+# import numpy as np
+# from sklearn.model_selection import train_test_split
+# from sklearn.preprocessing import StandardScaler
+# from tqdm.auto import tqdm
+# import math
+# import os
+
+# # --- 1. 설정 (Configuration) -------------------------------------------------
+# class ModelConfig:
+#     """모델 및 훈련 하이퍼파라미터"""
+#     DATA_PATH = r'C:\Users\bgh\Desktop\Framework\real\data\VED_final_with_grade.csv'
+#     FEATURES = ['speed_mps', 'acceleration_mps2', 'hour', 'day_of_week', 'grade']
+#     TARGET_FEATURE = 'speed_mps'
+
+#     INPUT_SEQ_LEN = 60
+#     PREDICTION_SEQ_LEN = 30
+
+#     D_MODEL = 128
+#     N_HEAD = 8
+#     N_ENCODER_LAYERS = 4
+#     N_DECODER_LAYERS = 4
+#     DIM_FEEDFORWARD = 512
+#     DROPOUT = 0.1
+
+#     BATCH_SIZE = 32
+#     LEARNING_RATE = 1e-4
+#     WEIGHT_DECAY = 1e-5       # L2 regularization
+#     EPOCHS = 50
+#     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+#     PATIENCE = 5              # Early stopping
+#     SAVE_PATH = 'best_probabilistic_transformer.pth'
+
+# # --- 2. 모델 아키텍처 ---------------------------------------------------------
+# class PositionalEncoding(nn.Module):
+#     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+#         super().__init__()
+#         self.dropout = nn.Dropout(dropout)
+
+#         position = torch.arange(max_len).unsqueeze(1)
+#         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+#         pe = torch.zeros(1, max_len, d_model)
+#         pe[0, :, 0::2] = torch.sin(position * div_term)
+#         pe[0, :, 1::2] = torch.cos(position * div_term)
+#         self.register_buffer('pe', pe)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         x = x + self.pe[:, :x.size(1)]
+#         return self.dropout(x)
+
+# class ProbabilisticTransformer(nn.Module):
+#     def __init__(self, config: ModelConfig):
+#         super().__init__()
+#         self.cfg = config
+
+#         self.input_projection = nn.Linear(len(config.FEATURES), config.D_MODEL)
+#         self.pos_encoder = PositionalEncoding(config.D_MODEL, config.DROPOUT)
+
+#         # learnable decoder start token (1,D_MODEL)
+#         self.start_token = nn.Parameter(torch.randn(1, 1, config.D_MODEL))
+
+#         self.transformer = nn.Transformer(
+#             d_model=config.D_MODEL,
+#             nhead=config.N_HEAD,
+#             num_encoder_layers=config.N_ENCODER_LAYERS,
+#             num_decoder_layers=config.N_DECODER_LAYERS,
+#             dim_feedforward=config.DIM_FEEDFORWARD,
+#             dropout=config.DROPOUT,
+#             batch_first=True
+#         )
+#         # self.output_projection = nn.Linear(config.D_MODEL, config.PREDICTION_SEQ_LEN * 2)
+#         self.output_projection = nn.Linear(config.D_MODEL, 2)
+
+#     def forward(self, src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+#         # src: (B, S_in, F)
+#         B = src.size(0)
+#         src = self.input_projection(src) * math.sqrt(self.cfg.D_MODEL)
+#         src = self.pos_encoder(src)
+
+#         # decoder 입력: learnable start token을 반복하여 길이 L 생성
+#         tgt = self.start_token.repeat(B, self.cfg.PREDICTION_SEQ_LEN, 1)
+#         tgt = self.pos_encoder(tgt)
+
+#         output = self.transformer(src, tgt)        # (B, L, D)
+#         output = self.output_projection(output)    # (B, L, 2)
+#         # output = output.view(B, self.cfg.PREDICTION_SEQ_LEN, 2)
+#         mu, log_var = output[..., 0], output[..., 1]
+#         return mu, log_var
+
+# # --- 3. 손실 함수 --------------------------------------------------------------
+# class GaussianNLLLoss(nn.Module):
+#     def __init__(self, eps: float = 1e-6):
+#         super().__init__()
+#         self.eps = eps
+
+#     def forward(self, mu, log_var, y_true):
+#         var = torch.exp(log_var) + self.eps
+#         log_prob = -0.5 * (torch.log(2 * math.pi * var) + (y_true - mu) ** 2 / var)
+#         return -log_prob.mean()
+
+# # --- 4. 데이터셋 ---------------------------------------------------------------
+# class VEDTimeSeriesDataset(Dataset):
+#     def __init__(self, df: pd.DataFrame, cfg: ModelConfig, scaler: StandardScaler):
+#         self.cfg = cfg
+#         self.scaler = scaler
+
+#         df[cfg.FEATURES] = self.scaler.transform(df[cfg.FEATURES])
+#         self.seq = []
+#         for _, g in tqdm(df.groupby('trip_id'), desc='Creating sequences'):
+#             x_all = g[cfg.FEATURES].values
+#             y_all = g[cfg.TARGET_FEATURE].values
+#             for i in range(len(g) - cfg.INPUT_SEQ_LEN - cfg.PREDICTION_SEQ_LEN + 1):
+#                 self.seq.append((
+#                     x_all[i:i + cfg.INPUT_SEQ_LEN],
+#                     y_all[i + cfg.INPUT_SEQ_LEN : i + cfg.INPUT_SEQ_LEN + cfg.PREDICTION_SEQ_LEN]
+#                 ))
+
+#     def __len__(self):
+#         return len(self.seq)
+
+#     def __getitem__(self, idx):
+#         x, y = self.seq[idx]
+#         return torch.FloatTensor(x), torch.FloatTensor(y)
+
+# # --- 5. 학습 / 평가 루프 -------------------------------------------------------
+# def train_one_epoch(model, loader, loss_fn, opt, device):
+#     model.train()
+#     total = 0
+#     for X, y in tqdm(loader, desc='Train'):
+#         X, y = X.to(device), y.to(device)
+#         opt.zero_grad()
+#         mu, log_var = model(X)
+#         loss = loss_fn(mu, log_var, y)
+#         loss.backward()
+#         opt.step()
+#         total += loss.item()
+#     return total / len(loader)
+
+# def evaluate(model, loader, loss_fn, device, target_scaler):
+#     model.eval()
+#     tot_loss, tot_mae, tot_rmse = 0, 0, 0
+#     with torch.no_grad():
+#         for X, y in tqdm(loader, desc='Val'):
+#             X, y = X.to(device), y.to(device)
+#             mu, log_var = model(X)
+#             loss = loss_fn(mu, log_var, y)
+#             tot_loss += loss.item()
+
+#             mu_un = torch.from_numpy(target_scaler.inverse_transform(mu.cpu())).to(device)
+#             y_un = torch.from_numpy(target_scaler.inverse_transform(y.cpu())).to(device)
+#             tot_mae += torch.mean(torch.abs(mu_un - y_un)).item()
+#             tot_rmse += torch.sqrt(torch.mean((mu_un - y_un) ** 2)).item()
+
+#     n = len(loader)
+#     return tot_loss / n, tot_mae / n, tot_rmse / n
+
+# # --- 6. 메인 -------------------------------------------------------------------
+# if __name__ == '__main__':
+#     cfg = ModelConfig()
+#     print(f'Device = {cfg.DEVICE}')
+
+#     df = pd.read_csv(cfg.DATA_PATH)
+#     train_ids, val_ids = train_test_split(df['trip_id'].unique(), test_size=0.2, random_state=42)
+#     train_df = df[df['trip_id'].isin(train_ids)].copy()
+#     val_df = df[df['trip_id'].isin(val_ids)].copy()
+
+#     feature_scaler = StandardScaler().fit(train_df[cfg.FEATURES])
+#     target_scaler = StandardScaler().fit(train_df[[cfg.TARGET_FEATURE]])
+
+#     train_ds = VEDTimeSeriesDataset(train_df, cfg, feature_scaler)
+#     val_ds   = VEDTimeSeriesDataset(val_df,   cfg, feature_scaler)
+
+#     train_dl = DataLoader(train_ds, cfg.BATCH_SIZE, shuffle=True,  num_workers=2)
+#     val_dl   = DataLoader(val_ds,   cfg.BATCH_SIZE, shuffle=False, num_workers=2)
+
+#     model = ProbabilisticTransformer(cfg).to(cfg.DEVICE)
+#     loss_fn = GaussianNLLLoss()
+#     opt = torch.optim.Adam(model.parameters(), lr=cfg.LEARNING_RATE,
+#                            weight_decay=cfg.WEIGHT_DECAY)
+#     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+#         opt, mode='min', factor=0.5, patience=3, verbose=True)
+
+#     best_val, patience_cnt = float('inf'), 0
+#     print('\n--- Training ---')
+#     for epoch in range(cfg.EPOCHS):
+#         tr_loss = train_one_epoch(model, train_dl, loss_fn, opt, cfg.DEVICE)
+#         val_loss, val_mae, val_rmse = evaluate(model, val_dl, loss_fn,
+#                                                cfg.DEVICE, target_scaler)
+
+#         scheduler.step(val_loss)
+
+#         print(f'Epoch {epoch+1:02}/{cfg.EPOCHS} | '
+#               f'Train {tr_loss:.4f} | Val {val_loss:.4f} | '
+#               f'MAE {val_mae:.3f} | RMSE {val_rmse:.3f}')
+
+#         # Early stopping & checkpoint
+#         if val_loss < best_val:
+#             best_val = val_loss
+#             patience_cnt = 0
+#             torch.save(model.state_dict(), cfg.SAVE_PATH)
+#             print(f'  ↳ Best model saved (val_loss={best_val:.4f})')
+#         else:
+#             patience_cnt += 1
+#             if patience_cnt >= cfg.PATIENCE:
+#                 print(f'Early stopping at epoch {epoch+1}')
+#                 break
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from tqdm.auto import tqdm
+import math
+import os
+
+# --- 1. 설정 (Configuration) -------------------------------------------------
+class ModelConfig:
+    """모델 및 훈련 하이퍼파라미터"""
+    # 데이터 경로 및 특징
+    DATA_PATH = r'C:\Users\bgh\Desktop\Framework\real\data\VED_final_with_grade.parquet'
+    FEATURES = ['speed_mps', 'acceleration_mps2', 'hour', 'day_of_week', 'grade']
+    TARGET_FEATURE = 'speed_mps'
+    
+    # 데이터 및 시퀀스 설정
+    INPUT_SEQ_LEN = 60
+    PREDICTION_SEQ_LEN = 30
+
+    # 모델 하이퍼파라미터
+    D_MODEL = 128
+    N_HEAD = 8
+    N_ENCODER_LAYERS = 4
+    N_DECODER_LAYERS = 4
+    DIM_FEEDFORWARD = 512
+    DROPOUT = 0.1
+
+    # 훈련 하이퍼파라미터 (메모리 문제 해결 후 원래 값으로 복원)
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    WEIGHT_DECAY = 1e-5
+    EPOCHS = 50
+    NUM_WORKERS = 0 # 0보다 큰 값으로 설정하여 데이터 로딩 속도 향상
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    PATIENCE = 5
+    SAVE_PATH = 'best_probabilistic_transformer.pth'
+
+# --- 2. 모델 아키텍처 ---------------------------------------------------------
+# (이전과 동일한 PositionalEncoding, ProbabilisticTransformer 클래스)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+class ProbabilisticTransformer(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        self.input_projection = nn.Linear(len(config.FEATURES), config.D_MODEL)
+        self.pos_encoder = PositionalEncoding(config.D_MODEL, config.DROPOUT)
+        self.transformer = nn.Transformer(
+            d_model=config.D_MODEL, nhead=config.N_HEAD,
+            num_encoder_layers=config.N_ENCODER_LAYERS, num_decoder_layers=config.N_DECODER_LAYERS,
+            dim_feedforward=config.DIM_FEEDFORWARD, dropout=config.DROPOUT, batch_first=True
+        )
+        self.output_projection = nn.Linear(config.D_MODEL, 2)
+
+    def forward(self, src: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        src = self.input_projection(src) * math.sqrt(self.config.D_MODEL)
+        src = self.pos_encoder(src)
+        tgt = torch.zeros(src.size(0), self.config.PREDICTION_SEQ_LEN, self.config.D_MODEL).to(self.config.DEVICE)
+        output = self.transformer(src, tgt)
+        output = self.output_projection(output)
+        mu, log_var = output[..., 0], output[..., 1]
+        return mu, log_var
+
+# --- 3. 손실 함수 --------------------------------------------------------------
+class GaussianNLLLoss(nn.Module):
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, mu: torch.Tensor, log_var: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        var = torch.exp(log_var) + self.epsilon
+        log_prob = -0.5 * (torch.log(2 * math.pi * var) + (y_true - mu)**2 / var)
+        return -torch.mean(log_prob)
+
+# --- 4. 데이터셋 (인덱싱 오류 수정 최종 버전) ---
+class VEDTimeSeriesDataset(Dataset):
+    """인덱싱 오류를 수정한 최종 메모리 효율적인 데이터셋"""
+    def __init__(self, df: pd.DataFrame, config: ModelConfig, scaler: StandardScaler):
+        self.config = config
+        
+        # 데이터프레임 전체를 클래스 내에 저장합니다.
+        self.df = df.copy()
+        # 중요: 스케일링을 __getitem__이 아닌 __init__에서 한 번만 수행하여 속도를 높입니다.
+        self.df[config.FEATURES] = scaler.transform(self.df[config.FEATURES])
+        
+        # 각 trip_id별로 데이터프레임을 미리 그룹화하여 딕셔너리에 저장해 둡니다.
+        # 이렇게 하면 __getitem__에서 매번 groupby를 호출할 필요가 없어 매우 빨라집니다.
+        self.grouped_by_trip = dict(tuple(self.df.groupby('trip_id')))
+        
+        # 모든 시퀀스의 위치를 (trip_id, trip 내 시작 인덱스)로 저장합니다.
+        self.indices = []
+        for trip_id, group in tqdm(self.grouped_by_trip.items(), desc="Creating sequence indices"):
+            num_sequences_in_trip = len(group) - config.INPUT_SEQ_LEN - config.PREDICTION_SEQ_LEN + 1
+            if num_sequences_in_trip > 0:
+                self.indices.extend([(trip_id, i) for i in range(num_sequences_in_trip)])
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        # 인덱스에서 trip_id와 해당 trip 내의 시작 위치(offset)를 가져옵니다.
+        trip_id, start_offset = self.indices[idx]
+        
+        # 미리 그룹화해둔 딕셔너리에서 해당 trip의 데이터프레임을 즉시 가져옵니다.
+        trip_data = self.grouped_by_trip[trip_id]
+        
+        # .iloc를 사용하여 trip_data 내에서 정확한 위치의 데이터를 슬라이싱합니다.
+        end_offset = start_offset + self.config.INPUT_SEQ_LEN + self.config.PREDICTION_SEQ_LEN
+        data_slice = trip_data.iloc[start_offset : end_offset]
+        
+        x_values = data_slice[self.config.FEATURES].values
+        y_values = data_slice[self.config.TARGET_FEATURE].values
+        
+        input_seq = x_values[:self.config.INPUT_SEQ_LEN]
+        target_seq = y_values[self.config.INPUT_SEQ_LEN:]
+        
+        return torch.FloatTensor(input_seq), torch.FloatTensor(target_seq)
+    
+# --- 5. 학습 / 평가 루프 -------------------------------------------------------
+# (이전과 동일)
+def train_one_epoch(model, dataloader, loss_fn, optimizer, device):
+    model.train()
+    total_loss = 0
+    for X, y in tqdm(dataloader, desc="Training"):
+        X, y = X.to(device), y.to(device)
+        optimizer.zero_grad()
+        mu, log_var = model(X)
+        loss = loss_fn(mu, log_var, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+def evaluate(model, dataloader, loss_fn, device, target_scaler):
+    model.eval()
+    total_loss, total_mae, total_rmse = 0, 0, 0
+    with torch.no_grad():
+        for X, y in tqdm(dataloader, desc="Evaluating"):
+            X, y = X.to(device), y.to(device)
+            mu, log_var = model(X)
+            loss = loss_fn(mu, log_var, y)
+            total_loss += loss.item()
+            
+            mu_unscaled = torch.from_numpy(target_scaler.inverse_transform(mu.cpu().numpy())).to(device)
+            y_unscaled = torch.from_numpy(target_scaler.inverse_transform(y.cpu().numpy())).to(device)
+            
+            total_mae += torch.mean(torch.abs(mu_unscaled - y_unscaled)).item()
+            total_rmse += torch.sqrt(torch.mean((mu_unscaled - y_unscaled)**2)).item()
+
+    avg_loss = total_loss / len(dataloader)
+    avg_mae = total_mae / len(dataloader)
+    avg_rmse = total_rmse / len(dataloader)
+    return avg_loss, avg_mae, avg_rmse
+
+# --- 6. 메인 실행 블록 (RAM 로드 버전) ---
+if __name__ == '__main__':
+    config = ModelConfig()
+    print(f"Device = {config.DEVICE}, Batch Size = {config.BATCH_SIZE}, Num Workers = {config.NUM_WORKERS}")
+    
+    print(f"Loading full dataset '{config.DATA_PATH}' into RAM...")
+    df = pd.read_parquet(config.DATA_PATH)
+    
+    all_trip_ids = df['trip_id'].unique()
+    train_ids, val_ids = train_test_split(all_trip_ids, test_size=0.2, random_state=42)
+    
+    train_df = df[df['trip_id'].isin(train_ids)]
+    val_df = df[df['trip_id'].isin(val_ids)]
+
+    print(f"Fitting scalers on training data ({len(train_ids)} trips)...")
+    feature_scaler = StandardScaler().fit(train_df[config.FEATURES])
+    target_scaler = StandardScaler().fit(train_df[[config.TARGET_FEATURE]])
+
+    print("Creating datasets (pre-loading to RAM)...")
+    train_dataset = VEDTimeSeriesDataset(train_df, config, feature_scaler)
+    val_dataset = VEDTimeSeriesDataset(val_df, config, feature_scaler)
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
+
+    model = ProbabilisticTransformer(config).to(config.DEVICE)
+    loss_fn = GaussianNLLLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3, verbose=True)
+    
+    best_val_loss = float('inf')
+    patience_counter = 0
+    print("\n--- Starting Training ---")
+    for epoch in range(config.EPOCHS):
+        train_loss = train_one_epoch(model, train_loader, loss_fn, optimizer, config.DEVICE)
+        val_loss, val_mae, val_rmse = evaluate(model, val_loader, loss_fn, config.DEVICE, target_scaler)
+        
+        scheduler.step(val_loss)
+        
+        print(f"Epoch {epoch+1:02d}/{config.EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val MAE: {val_mae:.4f} m/s | Val RMSE: {val_rmse:.4f} m/s")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), config.SAVE_PATH)
+            print(f"----> Best model saved at epoch {epoch+1} with validation loss: {best_val_loss:.4f}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config.PATIENCE:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
